@@ -1,0 +1,7 @@
+/terraform-provider-beacon
+/dist/
+*.exe
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
