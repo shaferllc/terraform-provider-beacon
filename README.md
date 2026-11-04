@@ -18,8 +18,8 @@ Full reference: [`docs/`](docs/index.md). Examples: [`examples/`](examples/).
 Requires Go 1.25+ and Terraform 1.0+.
 
 ```sh
-git clone https://github.com/shaferllc/beacon.git
-cd beacon/sdks/terraform-provider-beacon
+git clone https://github.com/shaferllc/terraform-provider-beacon.git
+cd terraform-provider-beacon
 go install .   # puts terraform-provider-beacon in $(go env GOPATH)/bin
 ```
 
