@@ -26,10 +26,11 @@ type fakeAPI struct {
 	pages    map[int]map[string]any
 	children map[string]map[int]map[string]any // collection -> id -> object
 	secrets  map[int]string                    // webhook id -> secret (never serialized)
+	browser  map[int]map[string]any            // monitor id -> browser_secrets (write-only, never serialized)
 }
 
 func newFakeAPI(t *testing.T) (*fakeAPI, *httptest.Server) {
-	f := &fakeAPI{pages: map[int]map[string]any{}, children: map[string]map[int]map[string]any{}, secrets: map[int]string{}}
+	f := &fakeAPI{pages: map[int]map[string]any{}, children: map[string]map[int]map[string]any{}, secrets: map[int]string{}, browser: map[int]map[string]any{}}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	return f, srv
@@ -146,11 +147,15 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					"expiry_alert_days": "14,7,1", "http_method": "GET", "expected_status_code": 200, "keyword": nil,
 					"keyword_match_type": "contains", "interval_minutes": 5, "timeout_seconds": 10, "consecutive_threshold": 3,
 					"allow_cold_start": false, "cold_start_timeout_seconds": 30, "check_window_start": nil,
-					"check_window_end": nil, "status_component_id": nil, "enabled": true, "heartbeat_url": nil,
+					"check_window_end": nil, "status_component_id": nil, "enabled": true, "heartbeat_url": nil, "browser_steps": nil,
 				})
 			case "webhooks":
 				merge(obj, map[string]any{"enabled": true, "status_component_id": nil})
 			}
+			if bs, ok := body["browser_secrets"].(map[string]any); ok {
+				f.browser[id] = bs
+			}
+			delete(body, "browser_secrets")
 			for k, v := range body {
 				if v != nil {
 					obj[k] = v
@@ -187,6 +192,21 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPatch:
 		if coll == "monitors" {
 			delete(body, "type") // the API ignores type on update
+			if bs, ok := body["browser_secrets"].(map[string]any); ok { // patch by name; null removes
+				if f.browser[id] == nil {
+					f.browser[id] = map[string]any{}
+				}
+				for k, v := range bs {
+					if v == nil {
+						delete(f.browser[id], k)
+					} else {
+						f.browser[id][k] = v
+					}
+				}
+			} else if _, sent := body["browser_secrets"]; sent {
+				delete(f.browser, id)
+			}
+			delete(body, "browser_secrets")
 		}
 		if s, ok := body["secret"].(string); ok {
 			f.secrets[id] = s
@@ -402,6 +422,67 @@ resource "beacon_webhook" "own_secret" {
 			{
 				ResourceName: "beacon_webhook.generated", ImportState: true, ImportStateIdFunc: childImportID("beacon_webhook.generated"),
 				ImportStateVerify: true, ImportStateVerifyIgnore: []string{"secret"},
+			},
+		},
+	})
+}
+
+func TestBrowserMonitor(t *testing.T) {
+	f, srv := newFakeAPI(t)
+	config := func(steps string, secrets string) string {
+		return providerBlock(srv.URL) + fmt.Sprintf(`
+resource "beacon_status_page" "main" {
+  name = "Acme"
+  slug = "acme"
+}
+resource "beacon_monitor" "login" {
+  status_page     = beacon_status_page.main.slug
+  name            = "Login flow"
+  type            = "browser"
+  browser_steps   = jsonencode(%s)
+  browser_secrets = %s
+}`, steps, secrets)
+	}
+	stored := func(want string) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			for _, m := range f.browser {
+				if got := fmt.Sprint(m); got != want {
+					return fmt.Errorf("server secrets = %s, want %s", got, want)
+				}
+			}
+			return nil
+		}
+	}
+	steps1 := `[{ action = "goto", url = "https://app.example.com/login" }, { action = "fill", selector = "#pw", value = "{{secret:PW}}" }, { action = "assert_text", text = "Welcome", timeout = 10000 }]`
+	steps2 := `[{ action = "goto", url = "https://app.example.com/login" }, { action = "assert_text", text = "Sign in" }]`
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: factories(),
+		CheckDestroy:             func(*terraform.State) error { return f.empty() },
+		Steps: []resource.TestStep{
+			{
+				Config: config(steps1, `{ PW = "hunter2", OTP = "123456" }`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("beacon_monitor.login", "type", "browser"),
+					resource.TestCheckResourceAttr("beacon_monitor.login", "browser_secrets.PW", "hunter2"),
+					stored("map[OTP:123456 PW:hunter2]"),
+				),
+			},
+			// Same steps written differently: no diff.
+			{Config: config(`[{ url = "https://app.example.com/login", action = "goto" }, { selector = "#pw", action = "fill", value = "{{secret:PW}}" }, { timeout = 10000, text = "Welcome", action = "assert_text" }]`, `{ PW = "hunter2", OTP = "123456" }`), PlanOnly: true},
+			{
+				// Dropping a key deletes that secret on the server; changing a value updates it.
+				Config: config(steps2, `{ PW = "new-pass" }`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("beacon_monitor.login", "browser_steps", `[{"action":"goto","url":"https://app.example.com/login"},{"action":"assert_text","text":"Sign in"}]`),
+					stored("map[PW:new-pass]"),
+				),
+			},
+			{
+				ResourceName: "beacon_monitor.login", ImportState: true, ImportStateIdFunc: childImportID("beacon_monitor.login"),
+				ImportStateVerify: true, ImportStateVerifyIgnore: []string{"browser_secrets"},
 			},
 		},
 	})

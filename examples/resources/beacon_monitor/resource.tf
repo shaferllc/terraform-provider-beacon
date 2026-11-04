@@ -47,3 +47,19 @@ resource "beacon_monitor" "mx" {
   dns_record_type    = "MX"
   dns_expected_value = "mx1.example.com"
 }
+
+resource "beacon_monitor" "login" {
+  status_page   = beacon_status_page.main.slug
+  name          = "Login flow"
+  type          = "browser" # Pro
+  browser_steps = jsonencode([
+    { action = "goto", url = "https://app.example.com/login" },
+    { action = "fill", selector = "#email", value = "monitor@example.com" },
+    { action = "fill", selector = "#password", value = "{{secret:LOGIN_PASSWORD}}" },
+    { action = "click", selector = "button[type=submit]" },
+    { action = "assert_text", text = "Dashboard" },
+  ])
+  browser_secrets = {
+    LOGIN_PASSWORD = var.monitor_password
+  }
+}

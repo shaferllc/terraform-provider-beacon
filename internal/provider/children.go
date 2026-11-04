@@ -121,6 +121,12 @@ func (r *childResource[M, P]) Update(ctx context.Context, req resource.UpdateReq
 		return
 	}
 	body := toAPI(&m)
+	var prior M
+	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	mapRemovals(&prior, body)
 	for _, k := range r.createOnly {
 		delete(body, k)
 	}
@@ -232,6 +238,8 @@ type monitorModel struct {
 	StatusComponentID       types.Int64  `tfsdk:"status_component_id" api:"w"`
 	Enabled                 types.Bool   `tfsdk:"enabled" api:"w"`
 	HeartbeatURL            types.String `tfsdk:"heartbeat_url"`
+	BrowserSteps            types.String `tfsdk:"browser_steps" api:"json"`
+	BrowserSecrets          types.Map    `tfsdk:"browser_secrets" api:"w"`
 }
 
 func optString(desc string, v ...validator.String) schema.StringAttribute {
@@ -255,13 +263,13 @@ var hhmm = stringvalidator.RegexMatches(regexp.MustCompile(`^([01]\d|2[0-3]):[0-
 func newMonitorResource() resource.Resource {
 	return &childResource[monitorModel, *monitorModel]{
 		typeName: "monitor", collection: "monitors", createOnly: []string{"type"},
-		desc: "An uptime monitor (http, heartbeat, tcp, ping or dns) on a status page. Unset optional+computed arguments take the server default (which can depend on your plan, e.g. `interval_minutes`).",
+		desc: "An uptime monitor (http, heartbeat, tcp, ping, dns or browser) on a status page. Unset optional+computed arguments take the server default (which can depend on your plan, e.g. `interval_minutes`).",
 		attrs: map[string]schema.Attribute{
 			"name": schema.StringAttribute{Required: true, Validators: []validator.String{stringvalidator.LengthBetween(1, 255)}},
 			"type": schema.StringAttribute{
-				Optional: true, Computed: true, Description: "`http` (default), `heartbeat`, `tcp`, `ping` or `dns`. Changing it replaces the monitor.",
+				Optional: true, Computed: true, Description: "`http` (default), `heartbeat`, `tcp`, `ping`, `dns` or `browser` (Pro). Changing it replaces the monitor.",
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown(), stringplanmodifier.RequiresReplace()},
-				Validators:    []validator.String{stringvalidator.OneOf("http", "heartbeat", "tcp", "ping", "dns")},
+				Validators:    []validator.String{stringvalidator.OneOf("http", "heartbeat", "tcp", "ping", "dns", "browser")},
 			},
 			"url":                    optString("URL to check. Required for `http`."),
 			"host":                   optString("Hostname or IP. Required for `tcp`, `ping` and `dns`. Must be lowercase (the API lowercases it).", stringvalidator.LengthAtMost(253), stringvalidator.RegexMatches(regexp.MustCompile(`^[^A-Z\s]+$`), "must be lowercase with no spaces")),
@@ -287,6 +295,14 @@ func newMonitorResource() resource.Resource {
 			"status_component_id":        schema.Int64Attribute{Optional: true, Description: "Component (on the same page) whose status this monitor drives."},
 			"enabled":                    computedBool("Defaults to `true`."),
 			"heartbeat_url":              schema.StringAttribute{Computed: true, Sensitive: true, PlanModifiers: keepString, Description: "Ping URL for `heartbeat` monitors."},
+			"browser_steps": schema.StringAttribute{
+				Optional:    true,
+				Description: "Steps for `browser` monitors as a JSON array, e.g. `jsonencode([{ action = \"goto\", url = \"https://app.example.com/login\" }, { action = \"fill\", selector = \"#password\", value = \"{{secret:LOGIN_PASSWORD}}\" }])`. Actions: goto, click, fill, press, wait_for_selector, wait_for_url, assert_text, assert_status. Required for `browser`.",
+			},
+			"browser_secrets": schema.MapAttribute{
+				ElementType: types.StringType, Optional: true, Sensitive: true,
+				Description: "Values for `{{secret:NAME}}` placeholders in `browser_steps` (names in CAPS_WITH_UNDERSCORES). Write-only on the API: Beacon never returns them, so drift made outside Terraform isn't detected. Removing a key deletes that secret.",
+			},
 		},
 	}
 }

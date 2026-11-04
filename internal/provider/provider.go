@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -111,7 +112,8 @@ func toAPI(model any) map[string]any {
 	v := reflect.ValueOf(model).Elem()
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Type().Field(i)
-		if f.Tag.Get("api") != "w" {
+		tag := f.Tag.Get("api")
+		if tag != "w" && tag != "json" {
 			continue
 		}
 		val := v.Field(i).Interface().(attr.Value)
@@ -123,7 +125,22 @@ func toAPI(model any) map[string]any {
 		default:
 			switch x := val.(type) {
 			case types.String:
+				if tag == "json" { // a jsonencode()d argument is sent as structured JSON
+					var decoded any
+					if json.Unmarshal([]byte(x.ValueString()), &decoded) == nil {
+						out[key] = decoded
+						continue
+					}
+				}
 				out[key] = x.ValueString()
+			case types.Map:
+				m := map[string]any{}
+				for k, e := range x.Elements() {
+					if s, ok := e.(types.String); ok {
+						m[k] = s.ValueString()
+					}
+				}
+				out[key] = m
 			case types.Int64:
 				out[key] = x.ValueInt64()
 			case types.Bool:
@@ -145,6 +162,23 @@ func fromAPI(data map[string]any, model any) {
 			continue
 		}
 		var val attr.Value
+		if f.Tag.Get("api") == "json" {
+			// Keep the configured string when it means the same thing, so key order or spacing never shows a diff.
+			if cur, ok := v.Field(i).Interface().(types.String); ok && !cur.IsNull() && !cur.IsUnknown() {
+				var decoded any
+				if json.Unmarshal([]byte(cur.ValueString()), &decoded) == nil && reflect.DeepEqual(decoded, raw) {
+					continue
+				}
+			}
+			if raw == nil {
+				val = types.StringNull()
+			} else {
+				b, _ := json.Marshal(raw)
+				val = types.StringValue(string(b))
+			}
+			v.Field(i).Set(reflect.ValueOf(val))
+			continue
+		}
 		switch v.Field(i).Interface().(type) {
 		case types.String:
 			switch x := raw.(type) {
@@ -173,6 +207,31 @@ func fromAPI(data map[string]any, model any) {
 			continue
 		}
 		v.Field(i).Set(reflect.ValueOf(val))
+	}
+}
+
+// mapRemovals turns keys dropped from a write-only map argument (e.g. browser_secrets) into
+// explicit nulls, since the API patches those maps by key and keeps keys it isn't sent.
+func mapRemovals(prior any, body map[string]any) {
+	pv := reflect.ValueOf(prior).Elem()
+	for i := 0; i < pv.NumField(); i++ {
+		if !pv.Type().Field(i).IsExported() {
+			continue
+		}
+		old, ok := pv.Field(i).Interface().(types.Map)
+		if !ok || old.IsNull() || old.IsUnknown() {
+			continue
+		}
+		key := pv.Type().Field(i).Tag.Get("tfsdk")
+		sent, isMap := body[key].(map[string]any)
+		if !isMap {
+			continue // null clears the whole map; unknown leaves it alone
+		}
+		for k := range old.Elements() {
+			if _, kept := sent[k]; !kept {
+				sent[k] = nil
+			}
+		}
 	}
 }
 
